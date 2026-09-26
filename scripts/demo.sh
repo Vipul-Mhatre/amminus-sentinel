@@ -78,7 +78,7 @@ fi
 if [ "$REHEARSE" = 1 ]; then
   MOCK_SCENARIO="crash"; [ "$REFUSE" = 1 ] && MOCK_SCENARIO="refuse"
   echo "    starting the scripted mock LLM on :9911 (scenario: $MOCK_SCENARIO)"
-  SENTINEL_KUBE_CONTEXT="$KUBE_CONTEXT" nohup python3 "$SENTINEL_ROOT/demo/test-llm/test_llm.py" \
+  SENTINEL_KUBE_CONTEXT="$KUBE_CONTEXT" nohup python3 "$SENTINEL_ROOT/demo/mock-llm/mock_llm.py" \
     --scenario "$MOCK_SCENARIO" > "$SENTINEL_RUN_DIR/mock-llm.log" 2>&1 &
   echo $! > "$MOCK_PID_FILE"
   wait_for_http "http://127.0.0.1:9911/v1/models" 20 || { echo "ERROR: mock LLM did not start" >&2; exit 1; }
