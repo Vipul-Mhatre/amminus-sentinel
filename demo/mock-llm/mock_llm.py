@@ -1,48 +1,34 @@
 #!/usr/bin/env python3
-"""OpenAI-compatible LLM used to rehearse Sentinel without connecting to an actual model.
+"""Scripted OpenAI-compatible mock LLM for rehearsing Sentinel WITHOUT a real model.
 
-TrueForge communicates with models through the OpenAI-compatible /v1/chat/completions streaming API.
-This server simulates a predefined SRE workflow by emitting scripted tool calls, allowing the entire
-pipeline to be exercised - including real TrueForge execution, real Kubernetes MCP operations, a
-real Kind cluster, and the human approval checkpoint - without requiring a model gateway key or
-incurring model usage costs.
+TrueForge talks to models over the OpenAI /v1/chat/completions streaming API. This server plays
+back a fixed "SRE runbook" as tool calls so you can exercise the complete pipeline - real TrueForge,
+real Kubernetes MCP tools, real Kind cluster, real approval pause - with no gateway key and no cost.
+It is a stand-in for the model only: every tool call it emits is executed for real by TrueForge
+against the real cluster, so what the terminal/UI shows (pod status, logs, restart counts) is real
+data, not fabricated text - only the CHOICE of tool call and the narration text are scripted.
 
-This server only substitutes for the model itself. Every tool call it produces is executed by
-TrueForge against the actual cluster. As a result, information displayed by the terminal or UI,
-such as pod state, logs, and restart counts, comes from the real cluster. Only the model's decision
-about which tool to invoke and the accompanying narration are predetermined.
+Two scenarios (--scenario):
+  crash (default) - the full happy path. Reads the failing pod (list -> describe -> logs), reproduces
+      the exact failure in sentinel-sandbox from the unmodified broken manifest, applies a patch on
+      top of that reproduction, verifies the sandbox pod actually recovers (status + logs), writes a
+      blast-radius report, applies the same patch to production (PAUSES for human approval), then
+      verifies production recovered the same way.
+  refuse - investigates identically, but the scripted patch is deliberately wrong (a typo'd env var
+      name), so the sandbox reproduction genuinely stays broken after the "fix". The script never
+      calls a production write tool at all - it stops and explains why, which is the demo's proof
+      that the agent knows when NOT to act. The verification failure is real (the pod really doesn't
+      recover), not asserted.
 
-Two scenarios are supported through --scenario:
+Because pod names carry a random suffix, this script shells out to `kubectl` itself (the same way a
+human operator would) to resolve the current pod name for `kubectl_describe`/`kubectl_logs` calls,
+so those tool calls carry real arguments even though the sequence of steps is fixed.
 
-  crash (default) - Runs the complete successful workflow. It locates the failing pod by listing
-      resources, describing the pod, and reading its logs. It then recreates the same failure in
-      sentinel-sandbox using the original broken manifest, applies a remediation patch, and checks
-      that the sandbox workload genuinely recovers by inspecting both status and logs. Afterward it
-      produces a blast-radius summary, applies the verified patch to production, pauses for human
-      approval, and finally verifies that production has recovered as expected.
-
-  refuse - Performs the same investigation and sandbox validation flow, but intentionally uses an
-      incorrect remediation containing a misspelled environment-variable name. Because the proposed
-      change does not actually resolve the failure, the sandbox remains unhealthy after the patch.
-      The workflow then stops without issuing any production write operation and explains why the
-      change should not proceed. The failed verification is based on the real sandbox state and logs,
-      rather than being simulated in the response.
-
-Pod names include dynamically generated suffixes, so this script invokes `kubectl` directly - similar
-to how an operator would - to discover the current pod name before constructing
-`kubectl_describe` and `kubectl_logs` calls. This keeps the generated tool arguments tied to the
-actual cluster resources even though the overall workflow is predetermined.
-
-After starting the server, configure it as a custom model provider in TrueForge
-(Settings -> Models):
-
-  type custom
-  name testllm
-  base URL http://127.0.0.1:9911/v1
-  API key: any value
-  model id: test
-
-The implementation uses only Python's standard library.
+Usage:
+  python3 demo/mock-llm/mock_llm.py [--port 9911] [--scenario crash|refuse]
+Then register it as a custom model provider in TrueForge (Settings -> Models):
+  type custom, name mockllm, base URL http://127.0.0.1:9911/v1, any API key, model id "mock".
+Stdlib only.
 """
 import argparse
 import json
@@ -124,54 +110,62 @@ def call_tool(mcp_server, tool_name, input_):
     return {"mcp_server": mcp_server, "tool_name": tool_name, "input": input_}
 
 
-BLAST_RADIUS_REPORT = f"""Production change review:
+BLAST_RADIUS_REPORT = f"""Blast-radius report before touching production:
 - Target: Deployment/{APP} in namespace {PROD_NS}
-- Change: add REQUIRED_CONFIG=production to container "{CONTAINER}"
-- Expected effect: the Deployment pod(s) will be restarted through a normal rollout
-- Scope: no other Kubernetes resources are modified
-- Evidence: the sandbox reproduced the same startup failure and recovered successfully after the exact patch
-- Risk: there may be brief application unavailability while the rollout completes; no persistent data is changed
+- Change: set container env REQUIRED_CONFIG=production on container "{CONTAINER}"
+- Expected effect: a rolling restart of this Deployment's pod(s), no other resources touched
+- Evidence: sentinel-sandbox reproduction failed with the identical error, and after this exact \
+patch the sandbox pod reached Running/Ready with clean startup logs
+- Risk: brief unavailability during the rollout restart; no data or other workloads affected
 
-The remediation has been validated in the sandbox. Applying the same patch to production now. Human approval is required for this production change."""
+Applying the same, already-verified patch to production now. This write needs human approval."""
 
 
 def crash_steps():
     return [
-        ("The alert points to a crashing pod in the default namespace. I’ll start by listing the pods to identify the affected workload.",
+        ("The alert names a crashing pod in the default namespace. Listing pods there to find it.",
          "call_tool", lambda: call_tool("k8s-prod", "kubectl_get",
             {"resourceType": "pods", "namespace": PROD_NS, "output": "json"})),
-        ("I found the affected pod. Next I’m inspecting its full configuration, including the container command, environment, restart count, and termination details.",
+        ("Describing the specific pod for full detail: container command/args, env, restart count, "
+         "and the last termination reason.",
          "call_tool", lambda: call_tool("k8s-prod", "kubectl_describe",
             {"resourceType": "pods", "name": pod_name(PROD_NS), "namespace": PROD_NS})),
-        ("Now I’m checking the container logs so the failure is confirmed from the application output rather than inferred only from the pod state.",
+        ("Reading the container's logs to confirm the exact failure message rather than guessing "
+         "from the exit reason alone.",
          "call_tool", lambda: call_tool("k8s-prod", "kubectl_logs",
             {"resourceType": "pod", "name": pod_name(PROD_NS), "namespace": PROD_NS,
              "container": CONTAINER, "tail": 20})),
-        ("The evidence shows the container expects $REQUIRED_CONFIG, but the Deployment does not provide that environment variable. The logs report that REQUIRED_CONFIG is missing. I’ll first validate the proposed remediation before changing any Kubernetes resource.",
-         "exec", lambda: {"intent": "Validate the proposed remediation before applying it",
+        ("Evidence: the container's command checks for $REQUIRED_CONFIG and exits with \"ERROR: "
+         "REQUIRED_CONFIG environment variable is not set\" when it's missing; describe confirms "
+         "the container has no env vars configured at all. Root cause: the Deployment's pod spec "
+         "is missing the REQUIRED_CONFIG environment variable. I'll validate a patch that adds it "
+         "in my code sandbox before it goes near the cluster.",
+         "exec", lambda: {"intent": "Validate the remediation before applying it anywhere",
              "command": "python3 - <<'PY'\nimport json\npatch = " + json.dumps(FIX_PATCH) +
                         "\nenv = patch['spec']['template']['spec']['containers'][0]['env'][0]\n"
                         "assert env['name'] == 'REQUIRED_CONFIG' and env['value']\n"
                         "print('patch validated (structurally):', env)\nPY"}),
-        ("The patch is structurally valid. That does not yet demonstrate that it resolves the runtime failure, so I’ll reproduce the production condition in sentinel-sandbox using the original broken manifest.",
+        ("Validated structurally - that only proves the patch is well-formed, not that it fixes "
+         "the problem. Reproducing the exact failure in sentinel-sandbox first, from the "
+         "unmodified broken manifest, via the sandbox connector.",
          "call_tool", lambda: call_tool("k8s-sandbox", "kubectl_apply",
             {"manifest": BROKEN_MANIFEST_SANDBOX, "namespace": SANDBOX_NS})),
-        ("The sandbox reproduction is being given time to start and enter the same failure state before I evaluate the proposed remediation.",
-         "exec", lambda: {"intent": "Wait for the sandbox reproduction to enter its failure state",
-             "command": "sleep 20"}),
-        ("I’ll now inspect the sandbox pod to verify that the reproduced workload is actually failing.",
+        ("Waiting for the sandbox pod to schedule and fail before I trust the reproduction.",
+         "exec", lambda: {"intent": "Wait for the sandbox reproduction to fail",
+             "command": "sleep 6"}),
+        ("Checking that the sandbox reproduction actually failed the same way as production.",
          "call_tool", lambda: call_tool("k8s-sandbox", "kubectl_get",
             {"resourceType": "pods", "namespace": SANDBOX_NS, "output": "wide"})),
-        ("The sandbox reproduces the failure. I’ll apply the validated environment-variable patch to this sandbox deployment and observe the result.",
+        ("Reproduction confirmed broken. Applying the validated patch on top of it.",
          "call_tool", lambda: call_tool("k8s-sandbox", "kubectl_patch",
             {"resourceType": "deployment", "name": APP, "namespace": SANDBOX_NS,
              "patchType": "strategic", "patchData": FIX_PATCH})),
-        ("The sandbox deployment has been updated. I’ll allow the rollout to complete before checking whether the workload recovered.",
-         "exec", lambda: {"intent": "Wait for the sandbox remediation rollout to complete", "command": "sleep 20"}),
-        ("I’ll check the sandbox pod state to determine whether the remediation restored the workload.",
+        ("Waiting for the sandbox rollout before checking health.",
+         "exec", lambda: {"intent": "Wait for the sandbox fix to roll out", "command": "sleep 6"}),
+        ("Checking sandbox pod status after the fix.",
          "call_tool", lambda: call_tool("k8s-sandbox", "kubectl_get",
             {"resourceType": "pods", "namespace": SANDBOX_NS, "output": "wide"})),
-        ("A healthy pod state is not sufficient by itself, so I’ll inspect the application logs for confirmation of a successful startup.",
+        ("Status alone isn't proof - reading the sandbox pod's logs to confirm a clean startup.",
          "call_tool", lambda: call_tool("k8s-sandbox", "kubectl_logs",
             {"resourceType": "pod", "name": pod_name(SANDBOX_NS), "namespace": SANDBOX_NS,
              "container": CONTAINER, "tail": 20})),
@@ -179,13 +173,14 @@ def crash_steps():
          "call_tool", lambda: call_tool("k8s-prod", "kubectl_patch",
             {"resourceType": "deployment", "name": APP, "namespace": PROD_NS,
              "patchType": "strategic", "patchData": FIX_PATCH})),
-        ("The production change was approved and applied. I’ll wait for the rollout to settle before performing the final health checks.",
-         "exec", lambda: {"intent": "Wait for the production rollout to settle before verification",
-             "command": "sleep 20"}),
-        ("I’ll inspect the production pod state to confirm the workload is healthy after the change.",
+        ("Approved and applied. Waiting before checking that production recovered.",
+         "exec", lambda: {"intent": "Wait before verifying production recovery",
+             "command": "sleep 6"}),
+        ("Checking production pod status.",
          "call_tool", lambda: call_tool("k8s-prod", "kubectl_get",
             {"resourceType": "pods", "namespace": PROD_NS, "output": "wide"})),
-        ("Finally, I’ll read the production container logs to verify that the application started successfully and is using the expected configuration.",
+        ("Reading production logs to confirm the application actually started cleanly, not just "
+         "that the pod phase changed.",
          "call_tool", lambda: call_tool("k8s-prod", "kubectl_logs",
             {"resourceType": "pod", "name": pod_name(PROD_NS), "namespace": PROD_NS,
              "container": CONTAINER, "tail": 20})),
@@ -194,42 +189,46 @@ def crash_steps():
 
 def refuse_steps():
     return [
-        ("The alert points to a crashing pod in the default namespace. I’ll begin by listing the pods to identify the affected workload.",
+        ("The alert names a crashing pod in the default namespace. Listing pods there to find it.",
          "call_tool", lambda: call_tool("k8s-prod", "kubectl_get",
             {"resourceType": "pods", "namespace": PROD_NS, "output": "json"})),
-        ("I’ll inspect the affected pod in detail to understand its container configuration, restart behavior, and termination information.",
+        ("Describing the specific pod for full detail: container command/args, env, restart count, "
+         "and the last termination reason.",
          "call_tool", lambda: call_tool("k8s-prod", "kubectl_describe",
             {"resourceType": "pods", "name": pod_name(PROD_NS), "namespace": PROD_NS})),
-        ("I’ll read the application logs to confirm the precise reason the container is exiting.",
+        ("Reading the container's logs to confirm the exact failure message.",
          "call_tool", lambda: call_tool("k8s-prod", "kubectl_logs",
             {"resourceType": "pod", "name": pod_name(PROD_NS), "namespace": PROD_NS,
              "container": CONTAINER, "tail": 20})),
-        ("The evidence indicates that the application exits because the expected configuration variable is absent. I’ll prepare a proposed remediation and first check that its structure is valid before making any cluster changes.",
-         "exec", lambda: {"intent": "Validate the proposed remediation before applying it",
+        ("Evidence: the container exits because it doesn't find a configuration value in its "
+         "environment. Proposing a fix that sets it, and validating the patch structurally before "
+         "it goes near the cluster.",
+         "exec", lambda: {"intent": "Validate the remediation before applying it anywhere",
              "command": "python3 - <<'PY'\nimport json\npatch = " + json.dumps(BAD_FIX_PATCH) +
                         "\nenv = patch['spec']['template']['spec']['containers'][0]['env'][0]\n"
                         "assert env['name'] and env['value']\n"
                         "print('patch validated (structurally):', env)\nPY"}),
-        ("The proposed patch passes structural validation, but that only confirms its format. I’ll reproduce the original failure in sentinel-sandbox before considering any production change.",
+        ("Structural validation only proves the patch is well-formed, not that it's correct. "
+         "Reproducing the exact failure in sentinel-sandbox first, from the unmodified broken "
+         "manifest.",
          "call_tool", lambda: call_tool("k8s-sandbox", "kubectl_apply",
             {"manifest": BROKEN_MANIFEST_SANDBOX, "namespace": SANDBOX_NS})),
-        ("I’ll wait for the sandbox workload to enter the expected failure state.",
-         "exec", lambda: {"intent": "Wait for the sandbox reproduction to enter its failure state",
-             "command": "sleep 20"}),
-        ("I’ll inspect the sandbox pod to confirm that the original failure has been reproduced.",
+        ("Waiting for the sandbox reproduction to fail.",
+         "exec", lambda: {"intent": "Wait for the sandbox reproduction to fail",
+             "command": "sleep 6"}),
+        ("Checking that the sandbox reproduction failed the same way as production.",
          "call_tool", lambda: call_tool("k8s-sandbox", "kubectl_get",
             {"resourceType": "pods", "namespace": SANDBOX_NS, "output": "wide"})),
-        ("The original failure is reproduced. I’ll apply the proposed remediation in the sandbox so its actual runtime behavior can be evaluated.",
+        ("Reproduction confirmed broken. Applying my proposed patch on top of it.",
          "call_tool", lambda: call_tool("k8s-sandbox", "kubectl_patch",
             {"resourceType": "deployment", "name": APP, "namespace": SANDBOX_NS,
              "patchType": "strategic", "patchData": BAD_FIX_PATCH})),
-        ("The sandbox deployment has been updated. I’ll wait for the rollout before determining whether the proposed remediation worked.",
-         "exec", lambda: {"intent": "Wait for the sandbox remediation rollout to complete",
-             "command": "sleep 20"}),
-        ("I’ll check the sandbox pod state to see whether the workload recovered.",
+        ("Waiting for the sandbox rollout before checking health.",
+         "exec", lambda: {"intent": "Wait for the sandbox fix to roll out", "command": "sleep 6"}),
+        ("Checking whether the sandbox pod recovered.",
          "call_tool", lambda: call_tool("k8s-sandbox", "kubectl_get",
             {"resourceType": "pods", "namespace": SANDBOX_NS, "output": "wide"})),
-        ("I’ll inspect the sandbox logs as the final verification step so I can confirm whether the application actually started successfully.",
+        ("Reading logs to confirm health, not just pod phase.",
          "call_tool", lambda: call_tool("k8s-sandbox", "kubectl_logs",
             {"resourceType": "pod", "name": pod_name(SANDBOX_NS), "namespace": SANDBOX_NS,
              "container": CONTAINER, "tail": 20})),
@@ -238,21 +237,21 @@ def refuse_steps():
 
 FINAL_TEXT = {
     "crash": (
-        "Root cause confirmed: the Deployment container was missing the REQUIRED_CONFIG environment "
-        "variable. The pod configuration and logs both confirmed the missing value. I reproduced the "
-        "same failure in sentinel-sandbox using the original manifest, applied the REQUIRED_CONFIG="
-        "production remediation there, and verified that the sandbox workload became healthy with a "
-        "successful startup log. After production approval, I applied the identical remediation to "
-        "the production Deployment and verified that the production workload recovered successfully, "
-        "with the expected startup message and stable pod state."
+        "Root cause: the Deployment's container was missing the REQUIRED_CONFIG environment "
+        "variable - confirmed via kubectl_describe (no env configured) and the container logs "
+        "(\"ERROR: REQUIRED_CONFIG environment variable is not set\"). I reproduced the exact "
+        "failure in sentinel-sandbox from the unmodified manifest, applied REQUIRED_CONFIG="
+        "production on top of it, and verified the sandbox pod reached Running/Ready with a clean "
+        "startup log before requesting approval. After approval I applied the identical patch to "
+        "the production Deployment and verified it recovered: Running, Ready, restart count no "
+        "longer climbing, logs show \"App running with config: production\"."
     ),
     "refuse": (
-        "Sandbox verification did not succeed. After applying the proposed patch, the sandbox "
-        "container continued to exit and its logs still reported that REQUIRED_CONFIG was not set. "
-        "The proposed value therefore did not reach the variable expected by the application. Since "
-        "the remediation has not been demonstrated to work, I did not make any production change. "
-        "The sandbox pod state and logs provide the evidence that the proposed fix requires further "
-        "investigation before production rollout."
+        "Sandbox verification failed: after applying my patch, the sandbox pod is still exiting "
+        "immediately and its logs still show \"ERROR: REQUIRED_CONFIG environment variable is not "
+        "set\" - the value I set didn't take effect. I have not proven this fix works, so I am NOT "
+        "applying it to production. Stopping here and requesting human input; the sandbox "
+        "reproduction and logs above are the evidence that the fix needs another look."
     ),
 }
 
@@ -316,5 +315,5 @@ if __name__ == "__main__":
     ap.add_argument("--scenario", choices=["crash", "refuse"], default="crash")
     a = ap.parse_args()
     Handler.scenario = a.scenario
-    print(f"LLM listening on http://{a.host}:{a.port}/v1 (scenario: {a.scenario})", file=sys.stderr)
+    print(f"mock LLM listening on http://{a.host}:{a.port}/v1 (scenario: {a.scenario})", file=sys.stderr)
     ThreadingHTTPServer((a.host, a.port), Handler).serve_forever()
