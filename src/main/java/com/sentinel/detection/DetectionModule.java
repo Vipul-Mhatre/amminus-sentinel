@@ -53,11 +53,8 @@ public final class DetectionModule {
 
     // Image-pull and container-config errors surface as container *reasons*
     // (state.waiting.reason), not pod phases, so they belong here alongside CrashLoopBackOff.
-    // OOMKilled was missing here until now: classifySeverity() already special-cased it, but this
-    // is the actual gate that decides whether a pod gets tracked at all - without it, an
-    // out-of-memory pod was silently never detected, regardless of restart count.
     public static Set<String> FAILURE_REASONS = Set.of(
-        "CrashLoopBackOff", "Error", "OOMKilled",
+        "CrashLoopBackOff", "Error",
         "ImagePullBackOff", "ImageInspectError",
         "CreateContainerConfigError", "ErrImagePull");
     public static Set<String> FAILURE_PHASES = Set.of("Failed", "Pending");
